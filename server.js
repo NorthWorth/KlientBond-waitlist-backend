@@ -7,7 +7,7 @@ const mongoose = require("mongoose");
 const crypto = require("crypto");
 const rateLimit = require("express-rate-limit");
 
-const Waitlist = require("./models/Waitlist");
+const Waitlist = require("./models/waitlist");
 const {
   sendVerificationEmail
 } = require("./services/emailService");
