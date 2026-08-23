@@ -1,7 +1,7 @@
 {
-  "name": "klientbond-backend",
+  "name": "rayern-backend",
   "version": "1.0.0",
-  "description": "KlientBond waitlist API",
+  "description": "Rayern waitlist API",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

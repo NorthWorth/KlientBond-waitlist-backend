@@ -18,7 +18,7 @@ async function sendVerificationEmail(
       to: [email],
 
       subject:
-        "Verify your KlientBond email",
+        "Verify your Rayern email",
 
       html: `
         <!DOCTYPE html>
@@ -35,7 +35,7 @@ async function sendVerificationEmail(
           >
 
           <title>
-            Verify your KlientBond email
+            Verify your Rayern email
           </title>
 
         </head>
@@ -78,7 +78,7 @@ async function sendVerificationEmail(
                   margin-bottom:30px;
                 "
               >
-                KlientBond
+                Rayern
               </div>
 
 
@@ -103,7 +103,7 @@ async function sendVerificationEmail(
                 "
               >
                 You're almost on the
-                KlientBond waitlist.
+                Rayern waitlist.
                 Confirm your email address
                 to complete your signup.
               </p>
@@ -151,7 +151,7 @@ async function sendVerificationEmail(
             >
               You're receiving this email because
               someone entered this address on
-              KlientBond.
+              Rayern.
             </p>
 
           </div>

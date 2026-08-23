@@ -114,7 +114,7 @@ function isValidEmail(email) {
 app.get("/", (req, res) => {
   res.json({
     success: true,
-    message: "KlientBond API is running."
+    message: "Rayern API is running."
   });
 });
 
@@ -178,7 +178,7 @@ app.post(
           success: false,
           code: "ALREADY_VERIFIED",
           message:
-            "This email is already on the KlientBond waitlist."
+            "This email is already on the Rayern waitlist."
         });
       }
 
