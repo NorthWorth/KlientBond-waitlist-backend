@@ -50,6 +50,7 @@ app.use(
 );
 
 app.use(express.json());
+app.set("trust proxy", 1);
 
 /* =========================================================
    RATE LIMITERS
@@ -228,7 +229,7 @@ app.post(
       ------------------------- */
 
       const verificationUrl =
-        `${FRONTEND_URL}/landing-page/frontend/verify.html?token=${rawToken}`;
+        `${FRONTEND_URL}/verify.html?token=${rawToken}`;
 
 
       /* -------------------------
