@@ -543,6 +543,102 @@ app.post(
 
 
 /* =========================================================
+   ADMIN LIST WAITLIST
+   Internal endpoint guarded by a shared
+   admin token. Never exposed publicly.
+========================================================= */
+
+function adminTokenMatches(provided, expected) {
+  if (!provided || !expected) {
+    return false;
+  }
+
+  const providedHash = crypto
+    .createHash("sha256")
+    .update(String(provided))
+    .digest();
+
+  const expectedHash = crypto
+    .createHash("sha256")
+    .update(String(expected))
+    .digest();
+
+  return crypto.timingSafeEqual(
+    providedHash,
+    expectedHash
+  );
+}
+
+
+app.get(
+  "/api/waitlist/admin/list",
+  async (req, res) => {
+
+    try {
+      const expectedToken =
+        process.env.ADMIN_TOKEN;
+
+      const providedToken =
+        req.header("x-admin-token");
+
+      if (
+        !adminTokenMatches(
+          providedToken,
+          expectedToken
+        )
+      ) {
+        return res.status(401).json({
+          success: false,
+          code: "UNAUTHORIZED",
+          message:
+            "Admin access denied."
+        });
+      }
+
+
+      const [signups, total] =
+        await Promise.all([
+          Waitlist.find(
+            {},
+            {
+              verificationToken: 0,
+              verificationTokenExpires: 0
+            }
+          )
+            .sort({ joinedAt: -1 })
+            .lean(),
+
+          Waitlist.countDocuments()
+        ]);
+
+
+      return res.status(200).json({
+        success: true,
+        data: {
+          total,
+          signups
+        }
+      });
+
+    } catch (error) {
+
+      console.error(
+        "Waitlist admin list error:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        code: "ADMIN_LIST_FAILED",
+        message:
+          "Unable to load waitlist signups."
+      });
+    }
+  }
+);
+
+
+/* =========================================================
    DATABASE + SERVER
 ========================================================= */
 
