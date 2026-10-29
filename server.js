@@ -471,7 +471,8 @@ app.get(
         return res.status(400).json({
           success: false,
           code: "TOKEN_REQUIRED",
-          message: "Verification token is missing."
+          message:
+            "Verification token is missing."
         });
       }
 
@@ -865,7 +866,8 @@ app.get(
         return res.status(401).json({
           success: false,
           code: "UNAUTHORIZED",
-          message: "Admin access denied."
+          message:
+            "Admin access denied."
         });
       }
 
@@ -884,7 +886,8 @@ app.get(
         return res.status(400).json({
           success: false,
           code: "INVALID_PAGINATION",
-          message: "page must be an integer >= 1 and limit an integer between 1 and 100."
+          message:
+            "page must be an integer >= 1 and limit an integer between 1 and 100."
         });
       }
 
@@ -907,7 +910,8 @@ app.get(
         return res.status(400).json({
           success: false,
           code: "INVALID_FILTER",
-          message: "verified and optedIn must be true or false."
+          message:
+            "verified and optedIn must be true or false."
         });
       }
 
@@ -1001,7 +1005,8 @@ app.get(
       return res.status(500).json({
         success: false,
         code: "ADMIN_LIST_FAILED",
-        message: "Unable to load waitlist signups."
+        message:
+          "Unable to load waitlist signups."
       });
     }
   }
