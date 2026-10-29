@@ -1,1 +1,1059 @@
-PLACEHOLDER
+const dotenv = require("dotenv");
+dotenv.config();
+
+const cors = require("cors");
+const express = require("express");
+const mongoose = require("mongoose");
+const crypto = require("crypto");
+const rateLimit = require("express-rate-limit");
+
+const Waitlist = require("./models/waitlist");
+const {
+  sendVerificationEmail
+} = require("./services/emailService");
+
+
+const app = express();
+
+const PORT = process.env.PORT || 5000;
+
+const FRONTEND_URL =
+  process.env.FRONTEND_URL || "http://127.0.0.1:5500";
+
+
+/* =========================================================
+   MIDDLEWARE
+========================================================= */
+
+const allowedOrigins = [
+  FRONTEND_URL
+];
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Allow requests without an Origin header.
+      // Useful for local tools and health checks.
+      if (!origin) {
+        return callback(null, true);
+      }
+
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      return callback(
+        new Error("Not allowed by CORS")
+      );
+    }
+  })
+);
+
+app.use(express.json());
+app.set("trust proxy", 1);
+
+/* =========================================================
+   RATE LIMITERS
+========================================================= */
+
+const waitlistLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+
+  message: {
+    success: false,
+    message: "Too many requests. Please try again later."
+  }
+});
+
+
+const verificationLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+
+  message: {
+    success: false,
+    message: "Too many verification requests. Please try again later."
+  }
+});
+
+
+/*
+ * Preference (consent) endpoint: withdrawing marketing consent is
+ * always allowed, but it is still an unauthenticated write surface,
+ * so it gets its own bounded budget.
+ */
+const consentLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+
+  message: {
+    success: false,
+    message: "Too many preference requests. Please try again later."
+  }
+});
+
+/* =========================================================
+   HELPERS
+========================================================= */
+
+function generateVerificationToken() {
+  return crypto
+    .randomBytes(32)
+    .toString("hex");
+}
+
+
+function hashToken(token) {
+  return crypto
+    .createHash("sha256")
+    .update(token)
+    .digest("hex");
+}
+
+
+function isValidEmail(email) {
+  const regex =
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+  return regex.test(email);
+}
+
+
+/* -----------------------------------------------------------------
+   Marketing consent helper.
+
+   Applies an EXPLICIT consent change and reports whether anything
+   actually changed. Timestamps are only stamped on a real
+   transition, so re-submitting the same preference is a no-op and
+   never fabricates a consent event.
+
+   consentedAt is history: it survives an opt-out (it records when
+   affirmative consent last happened) and is refreshed on every
+   opt-in.
+
+   Returns true when the record was modified (caller must save).
+----------------------------------------------------------------- */
+
+function applyConsentChange(user, optedIn, source) {
+  const current = Boolean(
+    user.marketingConsent?.optedIn
+  );
+  const next = Boolean(optedIn);
+
+  if (current === next) {
+    return false;
+  }
+
+  const now = new Date();
+
+  if (!user.marketingConsent) {
+    user.marketingConsent = {};
+  }
+
+  user.marketingConsent.optedIn = next;
+  user.marketingConsent.updatedAt = now;
+  user.marketingConsent.source = source;
+
+  if (next) {
+    user.marketingConsent.consentedAt = now;
+  }
+
+  return true;
+}
+
+
+/* -----------------------------------------------------------------
+   Admin-list query parsing.
+
+   Returns { ok: false } for malformed values so the endpoint can
+   answer 400 instead of silently falling back to defaults.
+----------------------------------------------------------------- */
+
+function parsePageParam(value, fallback) {
+  if (value === undefined) {
+    return fallback;
+  }
+
+  const parsed = Number(value);
+
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    return null;
+  }
+
+  return parsed;
+}
+
+
+function parseLimitParam(value, fallback) {
+  if (value === undefined) {
+    return fallback;
+  }
+
+  const parsed = Number(value);
+
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 100) {
+    return null;
+  }
+
+  return parsed;
+}
+
+
+function parseBooleanParam(value) {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (value === "true") {
+    return true;
+  }
+
+  if (value === "false") {
+    return false;
+  }
+
+  return null; // invalid
+}
+
+
+/* =========================================================
+   HEALTH CHECK
+========================================================= */
+
+app.get("/", (req, res) => {
+  res.json({
+    success: true,
+    message: "Rayern API is running."
+  });
+});
+
+
+/* =========================================================
+   JOIN WAITLIST
+========================================================= */
+
+app.post(
+  "/api/waitlist",
+  waitlistLimiter,
+  async (req, res) => {
+
+    try {
+      const { email, marketingConsent } = req.body;
+
+      /* -------------------------
+         Validate email
+      ------------------------- */
+
+      if (!email) {
+        return res.status(400).json({
+          success: false,
+          code: "EMAIL_REQUIRED",
+          message: "Email is required."
+        });
+      }
+
+      const normalizedEmail =
+        email.trim().toLowerCase();
+
+      if (!isValidEmail(normalizedEmail)) {
+        return res.status(400).json({
+          success: false,
+          code: "INVALID_EMAIL",
+          message:
+            "Please enter a valid email address."
+        });
+      }
+
+
+      /* -------------------------
+         Validate marketing consent
+         (optional; never inferred)
+      ------------------------- */
+
+      if (
+        marketingConsent !== undefined &&
+        typeof marketingConsent !== "boolean"
+      ) {
+        return res.status(400).json({
+          success: false,
+          code: "INVALID_MARKETING_CONSENT",
+          message:
+            "marketingConsent must be a boolean."
+        });
+      }
+
+
+      /* -------------------------
+         Find existing user
+      ------------------------- */
+
+      let waitlistUser =
+        await Waitlist.findOne({
+          email: normalizedEmail
+        });
+
+
+      /* -------------------------
+         Apply explicit consent change
+         (signup-form checkbox only)
+      ------------------------- */
+
+      const consentChanged =
+        waitlistUser &&
+        marketingConsent !== undefined &&
+        applyConsentChange(
+          waitlistUser,
+          marketingConsent,
+          "waitlist_form"
+        );
+
+
+      /* -------------------------
+         Already verified
+      ------------------------- */
+
+      if (
+        waitlistUser &&
+        waitlistUser.verified
+      ) {
+        /*
+         * The 409 signup contract is unchanged, but an explicit
+         * consent change arriving with this submission is
+         * persisted first so the opt-out path stays reliable for
+         * verified contacts.
+         */
+        if (consentChanged) {
+          await waitlistUser.save();
+        }
+
+        return res.status(409).json({
+          success: false,
+          code: "ALREADY_VERIFIED",
+          message:
+            "This email is already on the Rayern waitlist."
+        });
+      }
+
+
+      /* -------------------------
+         Generate token
+      ------------------------- */
+
+      const rawToken =
+        generateVerificationToken();
+
+      const hashedToken =
+        hashToken(rawToken);
+
+      const tokenExpires =
+        new Date(
+          Date.now() + 30 * 60 * 1000
+        );
+
+
+      /* -------------------------
+         Create pending user
+      ------------------------- */
+
+      if (!waitlistUser) {
+        waitlistUser =
+          new Waitlist({
+            email: normalizedEmail,
+            verified: false
+          });
+
+        /*
+         * New records only carry consent when the checkbox was
+         * explicitly checked. Absent/false stays optedIn: false
+         * with null timestamps (never-consented state).
+         */
+        if (marketingConsent === true) {
+          applyConsentChange(
+            waitlistUser,
+            true,
+            "waitlist_form"
+          );
+        }
+      }
+
+
+      /* -------------------------
+         Update verification data
+      ------------------------- */
+
+      waitlistUser.verificationToken =
+        hashedToken;
+
+      waitlistUser.verificationTokenExpires =
+        tokenExpires;
+
+
+      /* -------------------------
+         Build verification URL
+      ------------------------- */
+
+      const verificationUrl =
+        `${FRONTEND_URL}/verify.html?token=${rawToken}`;
+
+
+      /* -------------------------
+         Send email BEFORE saving
+         the new token.
+      ------------------------- */
+
+      await sendVerificationEmail(
+        normalizedEmail,
+        verificationUrl
+      );
+
+
+      /* -------------------------
+         Email was successfully
+         sent, so save token.
+      ------------------------- */
+
+      waitlistUser.lastVerificationSentAt =
+        new Date();
+
+      await waitlistUser.save();
+
+
+      return res.status(201).json({
+        success: true,
+        code: "VERIFICATION_SENT",
+        message:
+          "Check your inbox to verify your email."
+      });
+
+    } catch (error) {
+
+      console.error(
+        "Waitlist signup error:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        code: "EMAIL_SEND_FAILED",
+        message:
+          "We couldn't send the verification email. Please try again."
+      });
+    }
+  }
+);
+
+
+/* =========================================================
+   VERIFY EMAIL
+========================================================= */
+
+app.get(
+  "/api/waitlist/verify/:token",
+  verificationLimiter,
+  async (req, res) => {
+
+    try {
+      const { token } = req.params;
+
+
+      /* -------------------------
+         Validate token
+      ------------------------- */
+
+      if (!token) {
+        return res.status(400).json({
+          success: false,
+          code: "TOKEN_REQUIRED",
+          message: "Verification token is missing."
+        });
+      }
+
+
+      /* -------------------------
+         Hash token
+      ------------------------- */
+
+      const hashedToken =
+        hashToken(token);
+
+
+      /* -------------------------
+         Find valid token
+      ------------------------- */
+
+      const user =
+        await Waitlist.findOne({
+          verificationToken: hashedToken,
+
+          verificationTokenExpires: {
+            $gt: new Date()
+          }
+        });
+
+
+      if (!user) {
+        return res.status(400).json({
+          success: false,
+          code: "INVALID_TOKEN",
+          message:
+            "This verification link is invalid or has expired."
+        });
+      }
+
+
+      /* -------------------------
+         Verify email
+      ------------------------- */
+
+      user.verified = true;
+
+      user.verifiedAt =
+        new Date();
+
+      user.verificationToken =
+        null;
+
+      user.verificationTokenExpires =
+        null;
+
+
+      await user.save();
+
+
+      return res.status(200).json({
+        success: true,
+        code: "EMAIL_VERIFIED",
+        message:
+          "Your email has been verified."
+      });
+
+    } catch (error) {
+
+      console.error(
+        "Verification error:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        code: "VERIFICATION_FAILED",
+        message:
+          "Verification failed. Please try again."
+      });
+    }
+  }
+);
+
+
+/* =========================================================
+   RESEND VERIFICATION
+========================================================= */
+
+app.post(
+  "/api/waitlist/resend",
+  verificationLimiter,
+  async (req, res) => {
+
+    try {
+      const { email } = req.body;
+
+
+      /* -------------------------
+         Validate email
+      ------------------------- */
+
+      if (!email) {
+        return res.status(400).json({
+          success: false,
+          code: "EMAIL_REQUIRED",
+          message: "Email is required."
+        });
+      }
+
+
+      const normalizedEmail =
+        email.trim().toLowerCase();
+
+
+      if (!isValidEmail(normalizedEmail)) {
+        return res.status(400).json({
+          success: false,
+          code: "INVALID_EMAIL",
+          message:
+            "Please enter a valid email address."
+        });
+      }
+
+
+      /* -------------------------
+         Find user
+      ------------------------- */
+
+      const user =
+        await Waitlist.findOne({
+          email: normalizedEmail
+        });
+
+
+      /*
+       * Don't reveal whether an email
+       * exists or is verified.
+       */
+
+      if (!user || user.verified) {
+        return res.status(200).json({
+          success: true,
+          message:
+            "If that email needs verification, a new email has been sent."
+        });
+      }
+
+
+      /* -------------------------
+         Server-side cooldown
+      ------------------------- */
+
+      if (
+        user.lastVerificationSentAt &&
+        Date.now() -
+          user.lastVerificationSentAt.getTime() <
+          30 * 1000
+      ) {
+
+        return res.status(429).json({
+          success: false,
+          code: "RESEND_COOLDOWN",
+          message:
+            "Please wait 30 seconds before requesting another email."
+        });
+      }
+
+
+      /* -------------------------
+         Generate new token
+      ------------------------- */
+
+      const rawToken =
+        generateVerificationToken();
+
+      const hashedToken =
+        hashToken(rawToken);
+
+      const tokenExpires =
+        new Date(
+          Date.now() + 30 * 60 * 1000
+        );
+
+
+      /* -------------------------
+         Build verification URL
+      ------------------------- */
+
+      const verificationUrl =
+        `${FRONTEND_URL}/verify.html?token=${rawToken}`;
+
+
+      /* -------------------------
+         Send email
+      ------------------------- */
+
+      await sendVerificationEmail(
+        normalizedEmail,
+        verificationUrl
+      );
+
+
+      /* -------------------------
+         Save new token only after
+         email was successfully sent.
+      ------------------------- */
+
+      user.verificationToken =
+        hashedToken;
+
+      user.verificationTokenExpires =
+        tokenExpires;
+
+      user.lastVerificationSentAt =
+        new Date();
+
+
+      await user.save();
+
+
+      return res.status(200).json({
+        success: true,
+        message:
+            "If that email needs verification, a new email has been sent."
+      });
+
+    } catch (error) {
+
+      console.error(
+        "Resend verification error:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        code: "RESEND_FAILED",
+        message:
+          "Unable to resend the verification email."
+      });
+    }
+  }
+);
+
+
+/* =========================================================
+   MARKETING CONSENT (opt-out only)
+
+   Explicit, unauthenticated preference endpoint. Mirrors the
+   registered-user unsubscribe design: a request here can only
+   WITHDRAW consent — there is no path that opts an address in,
+   so a leaked/looping caller cannot create consent that the
+   owner never gave.
+
+   Opt-in happens only through the signup form's explicit
+   unchecked checkbox (POST /api/waitlist).
+
+   The response is deliberately GENERIC: it never reveals
+   whether the address exists on the waitlist.
+========================================================= */
+
+app.post(
+  "/api/waitlist/consent",
+  consentLimiter,
+  async (req, res) => {
+
+    try {
+      const { email, optedIn } = req.body;
+
+      if (!email) {
+        return res.status(400).json({
+          success: false,
+          code: "EMAIL_REQUIRED",
+          message: "Email is required."
+        });
+      }
+
+      const normalizedEmail =
+        email.trim().toLowerCase();
+
+      if (!isValidEmail(normalizedEmail)) {
+        return res.status(400).json({
+          success: false,
+          code: "INVALID_EMAIL",
+          message:
+            "Please enter a valid email address."
+        });
+      }
+
+      if (typeof optedIn !== "boolean") {
+        return res.status(400).json({
+          success: false,
+          code: "INVALID_OPTED_IN",
+          message: "optedIn must be a boolean."
+        });
+      }
+
+      if (optedIn) {
+        return res.status(400).json({
+          success: false,
+          code: "OPT_OUT_ONLY",
+          message:
+            "This endpoint can only withdraw marketing consent. " +
+            "Opt in with the checkbox when joining the waitlist."
+        });
+      }
+
+      const user =
+        await Waitlist.findOne({
+          email: normalizedEmail
+        });
+
+      if (user) {
+        const changed = applyConsentChange(
+          user,
+          false,
+          "preference_api"
+        );
+
+        if (changed) {
+          await user.save();
+        }
+      }
+
+      /* Generic success — existence is never disclosed. */
+      return res.status(200).json({
+        success: true,
+        code: "CONSENT_UPDATED",
+        message:
+          "Your marketing email preference has been saved."
+      });
+
+    } catch (error) {
+
+      console.error(
+        "Consent update error:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        code: "CONSENT_UPDATE_FAILED",
+        message:
+          "Unable to update your preference. Please try again."
+      });
+    }
+  }
+);
+
+
+/* =========================================================
+   ADMIN LIST WAITLIST
+   Internal endpoint guarded by a shared
+   admin token. Never exposed publicly.
+========================================================= */
+
+function adminTokenMatches(provided, expected) {
+  if (!provided || !expected) {
+    return false;
+  }
+
+  const providedHash = crypto
+    .createHash("sha256")
+    .update(String(provided))
+    .digest();
+
+  const expectedHash = crypto
+    .createHash("sha256")
+    .update(String(expected))
+    .digest();
+
+  return crypto.timingSafeEqual(
+    providedHash,
+    expectedHash
+  );
+}
+
+
+app.get(
+  "/api/waitlist/admin/list",
+  async (req, res) => {
+
+    try {
+      const expectedToken =
+        process.env.ADMIN_TOKEN;
+
+      const providedToken =
+        req.header("x-admin-token");
+
+      if (
+        !adminTokenMatches(
+          providedToken,
+          expectedToken
+        )
+      ) {
+        return res.status(401).json({
+          success: false,
+          code: "UNAUTHORIZED",
+          message: "Admin access denied."
+        });
+      }
+
+
+      /* -------------------------
+         Pagination (page/limit)
+      ------------------------- */
+
+      const page =
+        parsePageParam(req.query.page, 1);
+
+      const limit =
+        parseLimitParam(req.query.limit, 50);
+
+      if (page === null || limit === null) {
+        return res.status(400).json({
+          success: false,
+          code: "INVALID_PAGINATION",
+          message: "page must be an integer >= 1 and limit an integer between 1 and 100."
+        });
+      }
+
+
+      /* -------------------------
+         Optional filters:
+           verified  — email verification state
+           optedIn   — explicit marketing consent
+           email     — exact address (server-to-server
+                       consent revalidation)
+      ------------------------- */
+
+      const verified =
+        parseBooleanParam(req.query.verified);
+
+      const optedIn =
+        parseBooleanParam(req.query.optedIn);
+
+      if (verified === null || optedIn === null) {
+        return res.status(400).json({
+          success: false,
+          code: "INVALID_FILTER",
+          message: "verified and optedIn must be true or false."
+        });
+      }
+
+      const filter = {};
+
+      if (verified !== undefined) {
+        filter.verified = verified;
+      }
+
+      if (optedIn !== undefined) {
+        /*
+         * optedIn=false must match the NON-consented set: explicit
+         * false AND legacy documents written before the consent
+         * sub-document existed (missing field). $ne: true does both —
+         * while optedIn=true only ever matches an explicit true, so a
+         * consent-less record can never be read as opted in.
+         */
+        filter["marketingConsent.optedIn"] =
+          optedIn ? true : { $ne: true };
+      }
+
+      if (req.query.email !== undefined) {
+        const normalizedFilterEmail =
+          String(req.query.email)
+            .trim()
+            .toLowerCase();
+
+        if (!isValidEmail(normalizedFilterEmail)) {
+          return res.status(400).json({
+            success: false,
+            code: "INVALID_FILTER",
+            message: "email must be a valid address."
+          });
+        }
+
+        filter.email = normalizedFilterEmail;
+      }
+
+
+      /* -------------------------
+         Deterministic order:
+         newest first with _id tie-breaker so pages
+         never skip or repeat rows.
+      ------------------------- */
+
+      const [signups, total] =
+        await Promise.all([
+          Waitlist.find(
+            filter,
+            {
+              verificationToken: 0,
+              verificationTokenExpires: 0
+            }
+          )
+            .sort({ joinedAt: -1, _id: -1 })
+            .skip((page - 1) * limit)
+            .limit(limit)
+            .lean(),
+
+          Waitlist.countDocuments(filter)
+        ]);
+
+
+      return res.status(200).json({
+        success: true,
+        data: {
+          /* Kept for existing consumers. */
+          total,
+          signups,
+          pagination: {
+            page,
+            limit,
+            totalResults: total,
+            totalPages:
+              Math.max(
+                1,
+                Math.ceil(total / limit)
+              ),
+            hasNextPage: page * limit < total
+          }
+        }
+      });
+
+    } catch (error) {
+
+      console.error(
+        "Waitlist admin list error:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        code: "ADMIN_LIST_FAILED",
+        message: "Unable to load waitlist signups."
+      });
+    }
+  }
+);
+
+
+/* =========================================================
+   DATABASE + SERVER
+========================================================= */
+
+async function startServer() {
+
+  try {
+
+    await mongoose.connect(
+      process.env.MONGO_URI
+    );
+
+    console.log(
+      "MongoDB connected"
+    );
+
+
+    app.listen(
+      PORT,
+      () => {
+        console.log(
+          `Server running on port ${PORT}`
+        );
+      }
+    );
+
+  } catch (error) {
+
+    console.error(
+      "MongoDB connection failed:",
+      error.message
+    );
+
+    process.exit(1);
+  }
+}
+
+
+/*
+ * Start only when executed directly (`node server.js`). The smoke
+ * suite imports `app` and drives it against an in-memory MongoDB
+ * without opening a second listener.
+ */
+if (require.main === module) {
+  startServer();
+}
+
+
+module.exports = { app };
