@@ -691,7 +691,7 @@ app.post(
       return res.status(200).json({
         success: true,
         message:
-            "If that email needs verification, a new email has been sent."
+          "If that email needs verification, a new email has been sent."
       });
 
     } catch (error) {
