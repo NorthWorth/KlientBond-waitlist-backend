@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node test/waitlist-smoke.mjs"
   },
   "keywords": [],
   "author": "",
@@ -19,5 +19,8 @@
     "express-rate-limit": "^8.6.2",
     "mongoose": "^9.9.2",
     "resend": "^6.19.0"
+  },
+  "devDependencies": {
+    "mongodb-memory-server": "^11.3.0"
   }
 }

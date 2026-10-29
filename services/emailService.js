@@ -4,10 +4,27 @@ const resend =
   new Resend(process.env.RESEND_API_KEY);
 
 
+/*
+ * Test-only delivery override (same pattern as the Rayern API's
+ * email service): lets the smoke suite exercise the real signup
+ * and resend flows without contacting Resend. Null in every
+ * normal run.
+ */
+let transportOverride = null;
+
+function __setEmailTransportForTests(transport) {
+  transportOverride = transport;
+}
+
+
 async function sendVerificationEmail(
   email,
   verificationUrl
 ) {
+
+  if (transportOverride) {
+    return transportOverride(email, verificationUrl);
+  }
 
   const { data, error } =
     await resend.emails.send({
@@ -175,5 +192,6 @@ async function sendVerificationEmail(
 
 
 module.exports = {
-  sendVerificationEmail
+  sendVerificationEmail,
+  __setEmailTransportForTests
 };
