@@ -417,7 +417,7 @@ app.post(
       /* -------------------------
          Email was successfully
          sent, so save token.
-      ------------------------- */
+        ------------------------- */
 
       waitlistUser.lastVerificationSentAt =
         new Date();
@@ -578,7 +578,6 @@ app.post(
         });
       }
 
-
       const normalizedEmail =
         email.trim().toLowerCase();
 
@@ -725,9 +724,76 @@ app.post(
    Opt-in happens only through the signup form's explicit
    unchecked checkbox (POST /api/waitlist).
 
+   Two target shapes are accepted:
+
+     token  — the opaque `id.signature` link that NEW campaign
+              emails ship. No address appears in the URL; the
+              signature is verified against ADMIN_TOKEN below.
+
+     email  — the legacy `?email=` link already delivered by
+              earlier campaigns, kept working so those links do
+              not rot. New links never emit an address.
+
    The response is deliberately GENERIC: it never reveals
    whether the address exists on the waitlist.
 ========================================================= */
+
+/*
+   Verify an unsubscribe token issued by the Rayern API.
+
+   Mirrors server/src/services/waitlistUnsubscribeToken.js in the
+   Rayern service. Both deployments already hold the same shared
+   credential (ADMIN_TOKEN here, WAITLIST_ADMIN_TOKEN there — the
+   x-admin-token pair), so the signing key is DERIVED from it with a
+   fixed domain string rather than adding a second secret to either
+   side. The domain string and format are frozen: changing them
+   invalidates every link already sitting in an inbox.
+
+     subject   <24-hex record id>:waitlist-marketing-unsubscribe
+     signature base64url HMAC-SHA256 over subject, key derived
+
+   Returns the record id, or null for anything malformed, unsigned
+   or signed by someone else. Timing-safe comparison throughout.
+*/
+function verifyWaitlistUnsubscribeToken(token) {
+  if (typeof token !== "string" || !token.includes(".")) {
+    return null;
+  }
+
+  const separatorIndex = token.lastIndexOf(".");
+  const id = token.slice(0, separatorIndex);
+  const signature = token.slice(separatorIndex + 1);
+
+  if (!/^[0-9a-fA-F]{24}$/.test(id) || !signature) {
+    return null;
+  }
+
+  if (!process.env.ADMIN_TOKEN) {
+    return null;
+  }
+
+  const key = crypto
+    .createHmac("sha256", process.env.ADMIN_TOKEN)
+    .update("rayern-waitlist-unsubscribe:v1")
+    .digest();
+
+  const expected = crypto
+    .createHmac("sha256", key)
+    .update(`${id}:waitlist-marketing-unsubscribe`)
+    .digest("base64url");
+
+  const expectedBuffer = Buffer.from(expected);
+  const suppliedBuffer = Buffer.from(signature);
+
+  if (
+    expectedBuffer.length !== suppliedBuffer.length ||
+    !crypto.timingSafeEqual(expectedBuffer, suppliedBuffer)
+  ) {
+    return null;
+  }
+
+  return id;
+}
 
 app.post(
   "/api/waitlist/consent",
@@ -735,26 +801,61 @@ app.post(
   async (req, res) => {
 
     try {
-      const { email, optedIn } = req.body;
+      const { email, optedIn, token } = req.body;
 
-      if (!email) {
-        return res.status(400).json({
-          success: false,
-          code: "EMAIL_REQUIRED",
-          message: "Email is required."
-        });
-      }
+      /*
+        Resolve the request to a normalized address first.
+        A supplied token wins (it is the signature-checked input);
+        the address path below is byte-for-byte compatible with
+        links that were already sent.
+      */
+      let targetEmail = null;
 
-      const normalizedEmail =
-        email.trim().toLowerCase();
+      if (token !== undefined && token !== null && token !== "") {
+        const recordId = verifyWaitlistUnsubscribeToken(token);
 
-      if (!isValidEmail(normalizedEmail)) {
-        return res.status(400).json({
-          success: false,
-          code: "INVALID_EMAIL",
-          message:
-            "Please enter a valid email address."
-        });
+        if (!recordId) {
+          return res.status(400).json({
+            success: false,
+            code: "INVALID_TOKEN",
+            message:
+              "This unsubscribe link is not valid. Open the " +
+              "unsubscribe link from your email, or opt out by " +
+              "submitting the waitlist form again with the " +
+              "checkbox cleared."
+          });
+        }
+
+        const record = await Waitlist.findById(recordId)
+          .select("email")
+          .lean();
+
+        // A valid token whose record no longer exists behaves
+        // exactly like an unknown address below: generic success,
+        // no existence oracle.
+        targetEmail = record?.email ?? null;
+      } else {
+        if (!email) {
+          return res.status(400).json({
+            success: false,
+            code: "EMAIL_REQUIRED",
+            message: "Email is required."
+          });
+        }
+
+        const normalizedEmail =
+          email.trim().toLowerCase();
+
+        if (!isValidEmail(normalizedEmail)) {
+          return res.status(400).json({
+            success: false,
+            code: "INVALID_EMAIL",
+            message:
+              "Please enter a valid email address."
+          });
+        }
+
+        targetEmail = normalizedEmail;
       }
 
       if (typeof optedIn !== "boolean") {
@@ -775,10 +876,11 @@ app.post(
         });
       }
 
-      const user =
-        await Waitlist.findOne({
-          email: normalizedEmail
-        });
+      const user = targetEmail
+        ? await Waitlist.findOne({
+            email: targetEmail
+          })
+        : null;
 
       if (user) {
         const changed = applyConsentChange(
